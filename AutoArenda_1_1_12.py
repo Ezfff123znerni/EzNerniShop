@@ -869,6 +869,10 @@ class Settings(BaseModel):
     # Периодическая проверка аккаунтов (страж 2FA: проверка/восстановление аутентификатора).
     account_check_enabled: bool = True
 
+    # Команда !error (приём жалоб на вход). Можно временно отключить в меню «Ещё»:
+    # тогда на !error бот отвечает, что команда отключена, и просит описать проблему.
+    error_command_enabled: bool = True
+
     # NotLetters / перехват кодов и ссылок из писем.
     mail_provider: str = "notletters"  # notletters | gmail | outlook
     mail_intercept_enabled: bool = False
@@ -1124,6 +1128,7 @@ class CBT:
     CHATGPT_SELFTEST = "AAR:GPT_SELFTEST"
     CHATGPT_CHECK_NOW = "AAR:GPT_CHECK_NOW"
     ACCOUNT_CHECK_TOGGLE = "AAR:ACCOUNT_CHECK"
+    ERROR_CMD_TOGGLE = "AAR:ERROR_CMD_TOGGLE"
 
     OPEN_PROXY = "AAR:PROXY"
     PROXY_SET = "AAR:PROXY_SET"
@@ -7513,16 +7518,25 @@ def _security_kb():
 
 
 def _more_text() -> str:
+    error_state = "🟢 включена" if (SETTINGS and getattr(SETTINGS, "error_command_enabled", True)) else "🔴 отключена"
     return (
         "⚙️ Ещё\n\n"
-        f"📊 Лимит !code в день: {SETTINGS.max_per_day if SETTINGS else 3}\n\n"
-        "Редко используемые настройки: дневной лимит, резервные копии и логи."
+        f"📊 Лимит !code в день: {SETTINGS.max_per_day if SETTINGS else 3}\n"
+        f"🛠 Команда !error: {error_state}\n\n"
+        "Редко используемые настройки: дневной лимит, команда !error, резервные копии и логи.\n"
+        "Когда !error отключена — покупателю приходит просьба описать проблему со скриншотами."
     )
 
 
 def _more_kb():
     kb = K(row_width=1)
     kb.row(B(f"📊 Лимит !code в день: {SETTINGS.max_per_day if SETTINGS else 3}", None, CBT.SET_LIMIT))
+    kb.row(B(
+        "🛠 Команда !error: 🟢 вкл"
+        if (SETTINGS and getattr(SETTINGS, "error_command_enabled", True))
+        else "🛠 Команда !error: 🔴 выкл",
+        None, CBT.ERROR_CMD_TOGGLE,
+    ))
     kb.row(B("💾 Бэкап в Telegram", None, CBT.OPEN_BACKUP))
     kb.row(B("🧾 Логирование событий", None, CBT.OPEN_EVENT_LOGS))
     kb.row(B("↩️ Назад", None, CBT.BACK_MAIN))
@@ -9266,7 +9280,27 @@ def _broken_under_repair_text() -> str:
     )
 
 
+def _error_command_disabled_text() -> str:
+    return (
+        "🛠 Команда «!error» временно отключена\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Автоматическая проверка аккаунта сейчас недоступна — ведутся технические работы. "
+        "Но мы всё равно поможем — вручную и как можно быстрее. 💪\n\n"
+        "📝 Пожалуйста, опишите проблему одним сообщением:\n"
+        "   1️⃣ Что именно не так — не подходит код, не пускает в аккаунт, просит подтверждение и т.п.\n"
+        "   2️⃣ На каком шаге входа появляется ошибка.\n"
+        "   3️⃣ Приложите скриншоты экрана с ошибкой 📷 — так решим в разы быстрее.\n\n"
+        "✉️ Просто отправьте всё это в чат — продавец получит вашу заявку и оперативно разберётся.\n"
+        "🙏 Спасибо за терпение, мы уже на связи!"
+    )
+
+
 def _handle_error_command(cardinal: "Cardinal", message, rental: RentalRecord):
+    # Команда !error может быть временно отключена продавцом (меню «Ещё»).
+    if not getattr(SETTINGS, "error_command_enabled", True):
+        cardinal.send_message(message.chat_id, _error_command_disabled_text())
+        return
+
     _register_error_report(message, rental)
     account_number = getattr(rental, "account_number", 1) or 1
     chat_id = message.chat_id
@@ -12042,6 +12076,18 @@ def init(cardinal: "Cardinal"):
         save_settings()
         open_security(c=c)
 
+    def toggle_error_command(c: CallbackQuery):
+        SETTINGS.error_command_enabled = not getattr(SETTINGS, "error_command_enabled", True)
+        save_settings()
+        try:
+            bot.answer_callback_query(
+                c.id,
+                "Команда !error включена" if SETTINGS.error_command_enabled else "Команда !error отключена",
+            )
+        except Exception:
+            pass
+        open_more(c=c)
+
     def act_chatgpt_selftest(c: CallbackQuery):
         try:
             bot.answer_callback_query(c.id, "Запускаю проверку…")
@@ -12965,6 +13011,7 @@ def init(cardinal: "Cardinal"):
     tg.cbq_handler(lambda c: open_chatgpt_check(c=c), cbq_filter(data=CBT.OPEN_CHATGPT_CHECK))
     tg.cbq_handler(toggle_chatgpt_email_revert, cbq_filter(data=CBT.CHATGPT_TOGGLE_EMAIL_REVERT))
     tg.cbq_handler(toggle_account_check, cbq_filter(data=CBT.ACCOUNT_CHECK_TOGGLE))
+    tg.cbq_handler(toggle_error_command, cbq_filter(data=CBT.ERROR_CMD_TOGGLE))
     tg.cbq_handler(open_backup, cbq_filter(data=CBT.OPEN_BACKUP))
     tg.cbq_handler(act_backup_now, cbq_filter(data=CBT.BACKUP_NOW))
     tg.cbq_handler(open_stats, cbq_filter(data=CBT.OPEN_STATS))
