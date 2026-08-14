@@ -5862,6 +5862,7 @@ def _start_code_2fa_monitor(account: "AccountDataConfig", account_number: int):
         if not CODE_MONITOR_ACTIVE.get(account_number):
             CODE_MONITOR_ACTIVE[account_number] = True
             start_needed = True
+    label = f"№{account_number} ({account.login})"
     if start_needed:
         Thread(
             target=_code_2fa_monitor_worker,
@@ -5873,10 +5874,19 @@ def _start_code_2fa_monitor(account: "AccountDataConfig", account_number: int):
             f"{CODE_MONITOR_REFRESH_SECONDS} сек в течение "
             f"{CODE_MONITOR_WINDOW_SECONDS // 60} мин от последнего !code."
         )
+        _alert_bot_broadcast(
+            f"▶️ {label}: начал 2FA-мониторинг на {CODE_MONITOR_WINDOW_SECONDS // 60} мин — "
+            f"держу вкладку «Безопасность» и обновляю её раз в {CODE_MONITOR_REFRESH_SECONDS} сек. "
+            "Слежу, чтобы не выключили аутентификатор и не добавили ключ доступа."
+        )
     else:
         log(
             f"2FA-мониторинг №{account_number}: окно продлено ещё на "
             f"{CODE_MONITOR_WINDOW_SECONDS // 60} мин от нового !code."
+        )
+        _alert_bot_broadcast(
+            f"🔄 {label}: новый !code — продлил окно 2FA-мониторинга ещё на "
+            f"{CODE_MONITOR_WINDOW_SECONDS // 60} мин от последнего запроса."
         )
 
 
@@ -5921,6 +5931,7 @@ def _code_2fa_monitor_worker(account: "AccountDataConfig", account_number: int):
             except Exception:
                 logger.error(f"2FA-мониторинг №{account_number}: не удалось запустить дозаход по passkey.", exc_info=True)
         log(f"2FA-мониторинг №{account_number}: окно закрыто.")
+        _alert_bot_broadcast(f"⏹ {label}: 2FA-мониторинг завершён — окно {CODE_MONITOR_WINDOW_SECONDS // 60} мин истекло.")
 
 
 def _consume_passkey_pending(account_number: int) -> bool:
