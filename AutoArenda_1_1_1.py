@@ -167,6 +167,9 @@ CODE_MONITOR_LOCK = Lock()
 CODE_MONITOR_UNTIL: dict[int, float] = {}
 # account_number -> идёт ли уже поток мониторинга для этого аккаунта.
 CODE_MONITOR_ACTIVE: dict[int, bool] = {}
+# account_number -> пришло письмо о добавлении passkey, пока идёт мониторинг. Монитор
+# удалит ключ в СВОЕЙ открытой сессии и продолжит следить, без второго браузера.
+CODE_MONITOR_PASSKEY_PENDING: dict[int, bool] = {}
 
 # Авто-откат смены email ChatGPT через headless Playwright.
 _PLAYWRIGHT_MODULE: Any = None
@@ -3195,6 +3198,25 @@ def _maybe_handle_chatgpt_passkey_added(cardinal: "Cardinal", letter, account=No
 
     log(f"Обнаружено письмо OpenAI о добавлении ключа доступа: {_mail_field(letter, 'subject', '')}")
     detected_at = _now_msk()
+
+    # Если по этому аккаунту прямо сейчас идёт активный 2FA-мониторинг (открыта вкладка),
+    # НЕ поднимаем второй параллельный браузер: поручаем удаление самому монитору — он
+    # удалит ключ в своей же открытой сессии, а затем продолжит следить за 2FA.
+    with CODE_MONITOR_LOCK:
+        monitor_active = CODE_MONITOR_ACTIVE.get(account_number, False)
+        if monitor_active:
+            CODE_MONITOR_PASSKEY_PENDING[account_number] = True
+    if monitor_active:
+        _note_passkey_removal_triggered(account_number)
+        _alert_bot_broadcast(
+            "🚨 На аккаунт добавили ключ доступа (passkey)!\n\n"
+            f"🙍 Аккаунт: {account_login}\n"
+            f"📅 Дата: {detected_at.strftime('%d.%m.%Y')}\n"
+            f"🕒 Время (МСК): {detected_at.strftime('%H:%M:%S')}\n\n"
+            "🔁 Идёт 2FA-мониторинг — удаляю ключ в текущей сессии и продолжаю следить…"
+        )
+        return
+
     _alert_bot_broadcast(
         "🚨 На аккаунт добавили ключ доступа (passkey)!\n\n"
         f"🙍 Аккаунт: {account_login}\n"
@@ -5884,7 +5906,62 @@ def _code_2fa_monitor_worker(account: "AccountDataConfig", account_number: int):
     finally:
         with CODE_MONITOR_LOCK:
             CODE_MONITOR_ACTIVE[account_number] = False
+            leftover_passkey = CODE_MONITOR_PASSKEY_PENDING.pop(account_number, False)
+        # Окно закрылось, а письмо о passkey осталось необработанным (не успели на нём) —
+        # подстраховываемся отдельным заходом, чтобы ключ доступа точно сняли.
+        if leftover_passkey:
+            log(
+                f"2FA-мониторинг №{account_number}: окно закрылось с необработанным "
+                "письмом о passkey — удаляю ключ отдельным заходом."
+            )
+            try:
+                _trigger_account_passkey_removal(
+                    account, account_number, reason="passkey остался после окна мониторинга"
+                )
+            except Exception:
+                logger.error(f"2FA-мониторинг №{account_number}: не удалось запустить дозаход по passkey.", exc_info=True)
         log(f"2FA-мониторинг №{account_number}: окно закрыто.")
+
+
+def _consume_passkey_pending(account_number: int) -> bool:
+    """Забирает (и сбрасывает) сигнал «пришло письмо о passkey» для этого аккаунта."""
+    with CODE_MONITOR_LOCK:
+        if CODE_MONITOR_PASSKEY_PENDING.get(account_number):
+            CODE_MONITOR_PASSKEY_PENDING[account_number] = False
+            return True
+    return False
+
+
+def _monitor_remove_passkeys_inline(page, account: "AccountDataConfig", account_number: int, label: str):
+    """Удаляет ключи доступа в УЖЕ открытой сессии монитора и возвращается на страницу
+    безопасности, чтобы продолжить следить за 2FA."""
+    _alert_bot_broadcast(
+        f"🔐 {label}: во время 2FA-мониторинга обнаружен ключ доступа — удаляю в текущей сессии…"
+    )
+    try:
+        removed = _chatgpt_remove_all_passkeys(page, account, label)
+    except Exception:
+        logger.error(f"2FA-мониторинг {label}: ошибка удаления passkey.", exc_info=True)
+        removed = 0
+    still_present = False
+    try:
+        still_present = _passkeys_present(page)
+    except Exception:
+        pass
+    if still_present:
+        _alert_bot_broadcast(
+            f"⚠️ {label}: НЕ удалось полностью убрать ключ доступа (passkey) — нужна ручная проверка. "
+            "Продолжаю мониторинг 2FA."
+        )
+    elif removed:
+        _alert_bot_broadcast(f"🔐 {label}: удалил ключ доступа (passkeys): {removed}. Продолжаю мониторинг 2FA.")
+    else:
+        _alert_bot_broadcast(f"ℹ️ {label}: ключей доступа для удаления не найдено. Продолжаю мониторинг 2FA.")
+    # Возвращаемся на «Безопасность и вход», чтобы следующий цикл видел переключатель 2FA.
+    try:
+        _chatgpt_open_security_settings(page)
+    except Exception:
+        logger.debug(f"2FA-мониторинг {label}: не удалось вернуться на страницу безопасности.", exc_info=True)
 
 
 def _code_2fa_monitor_session(account: "AccountDataConfig", account_number: int, label: str) -> bool:
@@ -5937,6 +6014,13 @@ def _code_2fa_monitor_session(account: "AccountDataConfig", account_number: int,
                     # Сессия жива — сохраняем свежий снимок и садимся ОБНОВЛЯТЬ страницу.
                     _chatgpt_save_session(context, login)
                     while _code_monitor_window_active(account_number):
+                        # Пришло письмо о ключе доступа — СНАЧАЛА удаляем ключ в этой же
+                        # открытой сессии, ПОТОМ продолжаем следить за 2FA.
+                        if _consume_passkey_pending(account_number):
+                            _monitor_remove_passkeys_inline(page, account, account_number, label)
+                            if not _chatgpt_is_logged_in(page):
+                                lost_session = True
+                                break
                         state = _chatgpt_mfa_is_on(page)
                         if state is False:
                             detected_off = True
