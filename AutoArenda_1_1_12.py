@@ -5940,6 +5940,7 @@ def _code_2fa_monitor_session(account: "AccountDataConfig", account_number: int,
     proxy = _proxy_playwright()
     detected_off = False
     lost_session = False
+    kicked_on_page = False
     try:
         with playwright_api.sync_playwright() as p:
             browser, real_chrome = _chatgpt_launch_browser(p, proxy)
@@ -5965,6 +5966,24 @@ def _code_2fa_monitor_session(account: "AccountDataConfig", account_number: int,
                         state = _chatgpt_mfa_is_on(page)
                         if state is False:
                             detected_off = True
+                            # УСКОРЕНИЕ: вкладка уже открыта и залогинена — кикаем все сеансы
+                            # ПРЯМО ЗДЕСЬ (быстрый режим, без нового входа). Это выбивает
+                            # мошенника моментально; отдельный вход останется только на
+                            # включение 2FA.
+                            detected_at = _now_msk()
+                            _alert_bot_broadcast(
+                                "🚨 2FA ВЫКЛЮЧИЛИ во время аренды!\n\n"
+                                f"🙍 Аккаунт: {label}\n"
+                                f"📅 Дата: {detected_at.strftime('%d.%m.%Y')}\n"
+                                f"🕒 Время (МСК): {detected_at.strftime('%H:%M:%S')}\n\n"
+                                "🚪 Моментально выкидываю все сеансы прямо в открытой вкладке…"
+                            )
+                            _mark_self_mfa_change(account_number)
+                            try:
+                                kicked_on_page = _chatgpt_kick_all_sessions(page, account, label, fast=True)
+                            except Exception:
+                                logger.error(f"2FA-реакция {label}: быстрый кик в открытой вкладке не удался.", exc_info=True)
+                                kicked_on_page = False
                             break
                         # state True/None — обновляем страницу (НЕ перезаходим) и ждём 5 сек.
                         try:
@@ -5990,7 +6009,7 @@ def _code_2fa_monitor_session(account: "AccountDataConfig", account_number: int,
         return False
 
     if detected_off:
-        _react_2fa_turned_off(account, account_number, label)
+        _react_2fa_turned_off(account, account_number, label, already_kicked=kicked_on_page)
         return True
 
     if lost_session:
@@ -6007,30 +6026,38 @@ def _code_2fa_monitor_session(account: "AccountDataConfig", account_number: int,
     return False
 
 
-def _react_2fa_turned_off(account: "AccountDataConfig", account_number: int, label: str):
-    """Реакция на выключенный аутентификатор во время аренды. Порядок строго по заявке:
-    МОМЕНТАЛЬНО кик всех сеансов (как /kick) → перезаход → включение 2FA обратно (новый
-    ключ сохраняется в бота)."""
-    detected_at = _now_msk()
-    _alert_bot_broadcast(
-        "🚨 2FA ВЫКЛЮЧИЛИ во время аренды!\n\n"
-        f"🙍 Аккаунт: {label}\n"
-        f"📅 Дата: {detected_at.strftime('%d.%m.%Y')}\n"
-        f"🕒 Время (МСК): {detected_at.strftime('%H:%M:%S')}\n\n"
-        "🚪 Моментально выкидываю все сеансы, затем захожу и включаю 2FA заново…"
-    )
+def _react_2fa_turned_off(account: "AccountDataConfig", account_number: int, label: str, already_kicked: bool = False):
+    """Реакция на выключенный аутентификатор во время аренды: кик всех сеансов (как /kick)
+    → перезаход → включение 2FA обратно (новый ключ сохраняется в бота).
+
+    already_kicked=True — сеансы УЖЕ выбиты в открытой вкладке монитора (быстрый путь),
+    поэтому второй вход только на кик не нужен: сразу заходим и включаем 2FA."""
     # Окно тишины: письма OpenAI о нашем же включении 2FA не должны запустить ответной
     # сценарий снятия/пересоздания.
     _mark_self_mfa_change(account_number)
-    # 1) Кик всех сеансов (завершает в т.ч. текущую сессию бота).
-    try:
-        _run_chatgpt_login(account, account_number, post_action="kick_sessions")
-    except Exception:
-        logger.error(f"2FA-реакция {label}: кик сеансов не удался.", exc_info=True)
+
+    # 1) Кик всех сеансов. Если монитор уже кикнул в открытой вкладке — пропускаем
+    #    отдельный вход ради кика (это и есть ускорение: минус один полный вход).
+    if not already_kicked:
+        detected_at = _now_msk()
+        _alert_bot_broadcast(
+            "🚨 2FA ВЫКЛЮЧИЛИ во время аренды!\n\n"
+            f"🙍 Аккаунт: {label}\n"
+            f"📅 Дата: {detected_at.strftime('%d.%m.%Y')}\n"
+            f"🕒 Время (МСК): {detected_at.strftime('%H:%M:%S')}\n\n"
+            "🚪 Моментально выкидываю все сеансы, затем захожу и включаю 2FA заново…"
+        )
+        try:
+            _run_chatgpt_login(account, account_number, post_action="kick_sessions")
+        except Exception:
+            logger.error(f"2FA-реакция {label}: кик сеансов не удался.", exc_info=True)
+
     # Снимок сессии после выхода со всех устройств недействителен — убираем, чтобы
     # следующий заход прошёл начисто (email → пароль; 2FA сейчас выключен, кода не спросят).
     _delete_chatgpt_session(account.login)
+
     # 2) Заходим заново и включаем 2FA (post_action="check" → check_and_restore_mfa force).
+    _alert_bot_broadcast(f"🔁 {label}: сеансы сброшены — захожу заново и включаю 2FA…")
     _mark_self_mfa_change(account_number)
     try:
         _run_login_verify_notify(account, account_number, post_action="check")
