@@ -873,6 +873,10 @@ class Settings(BaseModel):
     # тогда на !error бот отвечает, что команда отключена, и просит описать проблему.
     error_command_enabled: bool = True
 
+    # Скриншоты мониторинга: когда включено, 2FA-монитор шлёт скриншот страницы каждый
+    # цикл (раз в 5 сек) в бот оповещений — для отладки, чтобы видеть, что происходит.
+    monitor_screenshot_enabled: bool = False
+
     # NotLetters / перехват кодов и ссылок из писем.
     mail_provider: str = "notletters"  # notletters | gmail | outlook
     mail_intercept_enabled: bool = False
@@ -1129,6 +1133,7 @@ class CBT:
     CHATGPT_CHECK_NOW = "AAR:GPT_CHECK_NOW"
     ACCOUNT_CHECK_TOGGLE = "AAR:ACCOUNT_CHECK"
     ERROR_CMD_TOGGLE = "AAR:ERROR_CMD_TOGGLE"
+    MONITOR_SHOT_TOGGLE = "AAR:MONITOR_SHOT_TOGGLE"
 
     OPEN_PROXY = "AAR:PROXY"
     PROXY_SET = "AAR:PROXY_SET"
@@ -5998,6 +6003,15 @@ def _code_2fa_monitor_session(account: "AccountDataConfig", account_number: int,
                         # безопасности (иногда reload отдаёт корень настроек).
                         if _chatgpt_mfa_is_on(page) is None:
                             _chatgpt_open_security_settings(page)
+                        # Скриншоты мониторинга (для отладки): раз в цикл шлём снимок в бот
+                        # оповещений, если включено в меню «Ещё».
+                        if getattr(SETTINGS, "monitor_screenshot_enabled", False):
+                            try:
+                                mfa_now = _chatgpt_mfa_is_on(page)
+                                mfa_txt = "🟢 вкл" if mfa_now else ("🔴 ВЫКЛ" if mfa_now is False else "❓ не определён")
+                                _cg_login_shot(page, f"🖥 2FA-мониторинг {label}: аутентификатор {mfa_txt}")
+                            except Exception:
+                                logger.debug(f"2FA-мониторинг {label}: не удалось отправить скриншот.", exc_info=True)
                         try:
                             page.wait_for_timeout(CODE_MONITOR_REFRESH_SECONDS * 1000)
                         except Exception:
@@ -7546,12 +7560,16 @@ def _security_kb():
 
 def _more_text() -> str:
     error_state = "🟢 включена" if (SETTINGS and getattr(SETTINGS, "error_command_enabled", True)) else "🔴 отключена"
+    shot_state = "🟢 включены" if (SETTINGS and getattr(SETTINGS, "monitor_screenshot_enabled", False)) else "🔴 выключены"
     return (
         "⚙️ Ещё\n\n"
         f"📊 Лимит !code в день: {SETTINGS.max_per_day if SETTINGS else 3}\n"
-        f"🛠 Команда !error: {error_state}\n\n"
-        "Редко используемые настройки: дневной лимит, команда !error, резервные копии и логи.\n"
-        "Когда !error отключена — покупателю приходит просьба описать проблему со скриншотами."
+        f"🛠 Команда !error: {error_state}\n"
+        f"🖥 Скриншоты мониторинга: {shot_state}\n\n"
+        "Редко используемые настройки: дневной лимит, команда !error, скриншоты мониторинга, "
+        "резервные копии и логи.\n"
+        "Когда !error отключена — покупателю приходит просьба описать проблему со скриншотами.\n"
+        "Скриншоты мониторинга: во время слежки за 2FA бот шлёт скриншот раз в 5 сек (для отладки)."
     )
 
 
@@ -7563,6 +7581,12 @@ def _more_kb():
         if (SETTINGS and getattr(SETTINGS, "error_command_enabled", True))
         else "🛠 Команда !error: 🔴 выкл",
         None, CBT.ERROR_CMD_TOGGLE,
+    ))
+    kb.row(B(
+        "🖥 Скриншоты мониторинга: 🟢 вкл"
+        if (SETTINGS and getattr(SETTINGS, "monitor_screenshot_enabled", False))
+        else "🖥 Скриншоты мониторинга: 🔴 выкл",
+        None, CBT.MONITOR_SHOT_TOGGLE,
     ))
     kb.row(B("💾 Бэкап в Telegram", None, CBT.OPEN_BACKUP))
     kb.row(B("🧾 Логирование событий", None, CBT.OPEN_EVENT_LOGS))
@@ -12115,6 +12139,19 @@ def init(cardinal: "Cardinal"):
             pass
         open_more(c=c)
 
+    def toggle_monitor_screenshot(c: CallbackQuery):
+        SETTINGS.monitor_screenshot_enabled = not getattr(SETTINGS, "monitor_screenshot_enabled", False)
+        save_settings()
+        try:
+            bot.answer_callback_query(
+                c.id,
+                "Скриншоты мониторинга включены" if SETTINGS.monitor_screenshot_enabled
+                else "Скриншоты мониторинга выключены",
+            )
+        except Exception:
+            pass
+        open_more(c=c)
+
     def act_chatgpt_selftest(c: CallbackQuery):
         try:
             bot.answer_callback_query(c.id, "Запускаю проверку…")
@@ -13039,6 +13076,7 @@ def init(cardinal: "Cardinal"):
     tg.cbq_handler(toggle_chatgpt_email_revert, cbq_filter(data=CBT.CHATGPT_TOGGLE_EMAIL_REVERT))
     tg.cbq_handler(toggle_account_check, cbq_filter(data=CBT.ACCOUNT_CHECK_TOGGLE))
     tg.cbq_handler(toggle_error_command, cbq_filter(data=CBT.ERROR_CMD_TOGGLE))
+    tg.cbq_handler(toggle_monitor_screenshot, cbq_filter(data=CBT.MONITOR_SHOT_TOGGLE))
     tg.cbq_handler(open_backup, cbq_filter(data=CBT.OPEN_BACKUP))
     tg.cbq_handler(act_backup_now, cbq_filter(data=CBT.BACKUP_NOW))
     tg.cbq_handler(open_stats, cbq_filter(data=CBT.OPEN_STATS))
