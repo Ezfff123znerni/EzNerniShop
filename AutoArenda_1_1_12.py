@@ -3946,12 +3946,6 @@ CHATGPT_HTTP_IMPERSONATE = "chrome"
 CHATGPT_HTTP_TIMEOUT = 15
 CHATGPT_AUTH_SESSION_URL = "https://chatgpt.com/api/auth/session"
 CHATGPT_ME_URL = "https://chatgpt.com/backend-api/me"
-# Эндпоинт «выйти со всех устройств» через запрос (без браузера). НЕДОКУМЕНТИРОВАН —
-# пока пусто, кик делает браузер. Впиши сюда точный URL (и метод/тело при необходимости),
-# который дёргает страница активных сеансов при нажатии «Выйти со всех устройств»
-# (видно в DevTools → Network), и HTTP-кик активируется автоматически.
-CHATGPT_HTTP_LOGOUT_URL = ""
-CHATGPT_HTTP_LOGOUT_METHOD = "POST"
 _CURL_CFFI_MODULE: Any = None
 _CURL_CFFI_FAILED = False
 
@@ -4069,56 +4063,6 @@ def _chatgpt_http_mfa_state(login: str) -> Optional[bool]:
     if isinstance(val, bool):
         return val
     return None  # поля нет / неожиданный формат — не рискуем, откат на браузер
-
-
-def _chatgpt_http_request(login: str, method: str, url: str, bearer: Optional[str] = None, json_body=None):
-    """Универсальный запрос (GET/POST/DELETE…) с cookies аккаунта и имперсонацией Chrome.
-    Возвращает (status_code, json|None) или (None, None) при сбое/недоступности curl_cffi."""
-    cffi = _cffi_requests()
-    if cffi is None:
-        return None, None
-    cookies = _chatgpt_http_cookies(login)
-    if not cookies:
-        return None, None
-    headers = {"accept": "application/json", "referer": "https://chatgpt.com/"}
-    if bearer:
-        headers["authorization"] = f"Bearer {bearer}"
-    try:
-        r = cffi.request(
-            method.upper(), url, cookies=cookies, headers=headers, json=json_body,
-            impersonate=CHATGPT_HTTP_IMPERSONATE, timeout=CHATGPT_HTTP_TIMEOUT,
-        )
-    except Exception:
-        logger.debug(f"HTTP: запрос {method} {url} не удался.", exc_info=True)
-        return None, None
-    try:
-        data = r.json()
-    except Exception:
-        data = None
-    return r.status_code, data
-
-
-def _chatgpt_http_kick_all_sessions(login: str) -> bool:
-    """Пытается выйти со ВСЕХ сеансов запросом (без браузера).
-    True — успешно (ответ 2xx); False — эндпоинт не задан / HTTP выключен / не удалось →
-    вызывающий откатывается на браузерный кик.
-
-    ВНИМАНИЕ: пока CHATGPT_HTTP_LOGOUT_URL пуст — всегда False (кик делает браузер).
-    Впиши реальный эндпоинт logout-all — и кик пойдёт по HTTP."""
-    if not getattr(SETTINGS, "http_monitor_enabled", False):
-        return False
-    url = (CHATGPT_HTTP_LOGOUT_URL or "").strip()
-    if not url:
-        return False
-    alive, token = _chatgpt_http_access_token(login)
-    if not alive:
-        return False
-    status, _ = _chatgpt_http_request(login, CHATGPT_HTTP_LOGOUT_METHOD, url, bearer=token)
-    if status is not None and 200 <= status < 300:
-        log(f"HTTP-кик: выход со всех сеансов выполнен запросом (status {status}).")
-        return True
-    logger.warning(f"HTTP-кик: запрос выхода вернул status {status} — откат на браузер.")
-    return False
 
 
 def _run_chatgpt_login(
@@ -6327,15 +6271,10 @@ def _react_2fa_turned_off(account: "AccountDataConfig", account_number: int, lab
             f"🕒 Время (МСК): {detected_at.strftime('%H:%M:%S')}\n\n"
             "🚪 Моментально выкидываю все сеансы, затем меняю пароль…"
         )
-        # Сначала пробуем кик ЗАПРОСОМ (быстро, без браузера). Если эндпоинт не задан
-        # или запрос не прошёл — откатываемся на браузерный кик.
-        if _chatgpt_http_kick_all_sessions(account.login):
-            _alert_bot_broadcast(f"🚪 {label}: сеансы сброшены запросом (без браузера).")
-        else:
-            try:
-                _run_chatgpt_login(account, account_number, post_action="kick_sessions")
-            except Exception:
-                logger.error(f"2FA-реакция {label}: кик сеансов не удался.", exc_info=True)
+        try:
+            _run_chatgpt_login(account, account_number, post_action="kick_sessions")
+        except Exception:
+            logger.error(f"2FA-реакция {label}: кик сеансов не удался.", exc_info=True)
 
     # Снимок сессии после выхода со всех устройств недействителен — убираем.
     _delete_chatgpt_session(account.login)
