@@ -6181,8 +6181,7 @@ def _code_2fa_monitor_session(account: "AccountDataConfig", account_number: int,
                             detected_off = True
                             # УСКОРЕНИЕ: вкладка уже открыта и залогинена — кикаем все сеансы
                             # ПРЯМО ЗДЕСЬ (быстрый режим, без нового входа). Это выбивает
-                            # мошенника моментально; отдельный вход останется только на
-                            # включение 2FA.
+                            # мошенника моментально; дальше реакция сменит пароль и включит 2FA.
                             detected_at = _now_msk()
                             _alert_bot_broadcast(
                                 "🚨 2FA ВЫКЛЮЧИЛИ во время аренды!\n\n"
@@ -6249,11 +6248,14 @@ def _code_2fa_monitor_session(account: "AccountDataConfig", account_number: int,
 
 
 def _react_2fa_turned_off(account: "AccountDataConfig", account_number: int, label: str, already_kicked: bool = False):
-    """Реакция на выключенный аутентификатор во время аренды: кик всех сеансов (как /kick)
-    → перезаход → включение 2FA обратно (новый ключ сохраняется в бота).
+    """Реакция на выключенный аутентификатор во время аренды. Порядок:
+    МОМЕНТАЛЬНО кик всех сеансов → смена пароля аккаунта → перезаход и включение 2FA обратно.
+
+    Кик выбивает мошенника сразу, смена пароля запирает его насовсем (даже со старым
+    паролем не войдёт), включение 2FA возвращает аккаунт в рабочее состояние для !code.
 
     already_kicked=True — сеансы УЖЕ выбиты в открытой вкладке монитора (быстрый путь),
-    поэтому второй вход только на кик не нужен: сразу заходим и включаем 2FA."""
+    поэтому отдельный вход ради кика не нужен."""
     # Окно тишины: письма OpenAI о нашем же включении 2FA не должны запустить ответной
     # сценарий снятия/пересоздания.
     _mark_self_mfa_change(account_number)
@@ -6267,19 +6269,39 @@ def _react_2fa_turned_off(account: "AccountDataConfig", account_number: int, lab
             f"🙍 Аккаунт: {label}\n"
             f"📅 Дата: {detected_at.strftime('%d.%m.%Y')}\n"
             f"🕒 Время (МСК): {detected_at.strftime('%H:%M:%S')}\n\n"
-            "🚪 Моментально выкидываю все сеансы, затем захожу и включаю 2FA заново…"
+            "🚪 Моментально выкидываю все сеансы, затем меняю пароль…"
         )
         try:
             _run_chatgpt_login(account, account_number, post_action="kick_sessions")
         except Exception:
             logger.error(f"2FA-реакция {label}: кик сеансов не удался.", exc_info=True)
 
-    # Снимок сессии после выхода со всех устройств недействителен — убираем, чтобы
-    # следующий заход прошёл начисто (email → пароль; 2FA сейчас выключен, кода не спросят).
+    # Снимок сессии после выхода со всех устройств недействителен — убираем.
     _delete_chatgpt_session(account.login)
 
-    # 2) Заходим заново и включаем 2FA (post_action="check" → check_and_restore_mfa force).
-    _alert_bot_broadcast(f"🔁 {label}: сеансы сброшены — захожу заново и включаю 2FA…")
+    # 2) Смена пароля через «Забыли пароль?» (новый пароль сохраняется в аккаунт бота).
+    #    Работает без активной сессии — как раз после кика. Внутри делается и проверочный вход.
+    _alert_bot_broadcast(f"🔑 {label}: сеансы сброшены — меняю пароль аккаунта…")
+    try:
+        ok, new_password = _recover_password_and_verify(account, account_number)
+    except Exception:
+        logger.error(f"2FA-реакция {label}: смена пароля не удалась.", exc_info=True)
+        ok, new_password = False, ""
+    if ok:
+        _unmark_account_broken(account_number)
+        _alert_bot_broadcast(
+            f"✅ {label}: пароль изменён и сохранён.\n"
+            f"🔐 Новый пароль: {new_password}\n"
+            "Покупатели получат его командой !account."
+        )
+    else:
+        _alert_bot_broadcast(
+            f"⚠️ {label}: не удалось сменить пароль автоматически — нужна ручная проверка "
+            "(скриншоты в боте оповещений)."
+        )
+
+    # 3) Заходим (уже под новым паролем) и включаем 2FA обратно.
+    _alert_bot_broadcast(f"🔁 {label}: включаю 2FA заново…")
     _mark_self_mfa_change(account_number)
     try:
         _run_login_verify_notify(account, account_number, post_action="check")
