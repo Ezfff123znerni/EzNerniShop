@@ -877,6 +877,10 @@ class Settings(BaseModel):
     # цикл (раз в 5 сек) в бот оповещений — для отладки, чтобы видеть, что происходит.
     monitor_screenshot_enabled: bool = False
 
+    # HTTP-мониторинг: опрашивать состояние 2FA лёгкими запросами (curl_cffi), а браузер
+    # поднимать только для реакции/переустановки сессии. По умолчанию выкл (опытная функция).
+    http_monitor_enabled: bool = False
+
     # NotLetters / перехват кодов и ссылок из писем.
     mail_provider: str = "notletters"  # notletters | gmail | outlook
     mail_intercept_enabled: bool = False
@@ -1134,6 +1138,7 @@ class CBT:
     ACCOUNT_CHECK_TOGGLE = "AAR:ACCOUNT_CHECK"
     ERROR_CMD_TOGGLE = "AAR:ERROR_CMD_TOGGLE"
     MONITOR_SHOT_TOGGLE = "AAR:MONITOR_SHOT_TOGGLE"
+    HTTP_MONITOR_TOGGLE = "AAR:HTTP_MONITOR_TOGGLE"
 
     OPEN_PROXY = "AAR:PROXY"
     PROXY_SET = "AAR:PROXY_SET"
@@ -3929,6 +3934,137 @@ def _chatgpt_save_session(context, login: str):
         logger.debug(f"Не удалось сохранить сессию ChatGPT для {login}.", exc_info=True)
 
 
+# ── Лёгкий HTTP-доступ к ChatGPT (без браузера) для быстрого мониторинга ──────
+# Идея: сессию получает браузер (как и раньше), а состояние аккаунта опрашиваем
+# обычными запросами — это в разы легче и быстрее, чем гонять headless-браузер.
+# Cloudflare обычным requests не пройти, поэтому используем curl_cffi с имперсонацией
+# Chrome (тот же TLS-отпечаток, что у настоящего браузера).
+# ВАЖНО: запросы НЕ заменяют браузер полностью — вход, включение 2FA, удаление passkey
+# и т.п. по-прежнему делает браузер. Запросы — только для быстрой ПРОВЕРКИ состояния.
+# При любой неуверенности функции возвращают None → монитор откатывается на браузер.
+CHATGPT_HTTP_IMPERSONATE = "chrome"
+CHATGPT_HTTP_TIMEOUT = 15
+CHATGPT_AUTH_SESSION_URL = "https://chatgpt.com/api/auth/session"
+CHATGPT_ME_URL = "https://chatgpt.com/backend-api/me"
+_CURL_CFFI_MODULE: Any = None
+_CURL_CFFI_FAILED = False
+
+
+def _cffi_requests():
+    """Лениво импортирует curl_cffi.requests (ставит пакет при отсутствии).
+    Возвращает модуль или None, если недоступен."""
+    global _CURL_CFFI_MODULE, _CURL_CFFI_FAILED
+    if _CURL_CFFI_MODULE is not None:
+        return _CURL_CFFI_MODULE
+    if _CURL_CFFI_FAILED:
+        return None
+    try:
+        from curl_cffi import requests as cffi_requests  # type: ignore
+    except Exception:
+        try:
+            _pip_install("curl_cffi")
+            from curl_cffi import requests as cffi_requests  # type: ignore
+        except Exception:
+            logger.warning("HTTP-мониторинг: curl_cffi недоступен — работаю только через браузер.", exc_info=True)
+            _CURL_CFFI_FAILED = True
+            return None
+    _CURL_CFFI_MODULE = cffi_requests
+    return cffi_requests
+
+
+def _chatgpt_http_cookies(login: str) -> dict:
+    """Достаёт cookies chatgpt.com/openai.com из сохранённого браузером снимка сессии."""
+    cookies: dict = {}
+    try:
+        path = _chatgpt_session_path(login)
+        if not (login and os.path.isfile(path)):
+            return cookies
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for c in data.get("cookies", []) or []:
+            domain = str(c.get("domain", "") or "").lstrip(".").casefold()
+            if "chatgpt.com" in domain or "openai.com" in domain:
+                name, value = c.get("name"), c.get("value")
+                if name and value is not None:
+                    cookies[name] = value
+    except Exception:
+        logger.debug(f"HTTP-мониторинг: не удалось прочитать cookies из снимка сессии {login}.", exc_info=True)
+    return cookies
+
+
+def _chatgpt_http_get_json(login: str, url: str, bearer: Optional[str] = None):
+    """GET с cookies аккаунта и имперсонацией Chrome. Возвращает (status_code, json|None)
+    или (None, None) при сбое/недоступности curl_cffi."""
+    cffi = _cffi_requests()
+    if cffi is None:
+        return None, None
+    cookies = _chatgpt_http_cookies(login)
+    if not cookies:
+        return None, None
+    headers = {"accept": "application/json", "referer": "https://chatgpt.com/"}
+    if bearer:
+        headers["authorization"] = f"Bearer {bearer}"
+    try:
+        r = cffi.get(
+            url, cookies=cookies, headers=headers,
+            impersonate=CHATGPT_HTTP_IMPERSONATE, timeout=CHATGPT_HTTP_TIMEOUT,
+        )
+    except Exception:
+        logger.debug(f"HTTP-мониторинг: запрос {url} не удался.", exc_info=True)
+        return None, None
+    try:
+        data = r.json()
+    except Exception:
+        data = None
+    return r.status_code, data
+
+
+def _chatgpt_http_access_token(login: str):
+    """Проверяет сессию через /api/auth/session. Возвращает (alive, access_token):
+      • (True, token)  — сессия жива;
+      • (True, None)   — сессия жива, но токена нет;
+      • (False, None)  — сессия слетела (пустой ответ / 401);
+      • (None, None)   — определить не удалось (нет curl_cffi/сеть) → откат на браузер."""
+    status, data = _chatgpt_http_get_json(login, CHATGPT_AUTH_SESSION_URL)
+    if status is None:
+        return None, None
+    if status == 401:
+        return False, None
+    if status != 200 or not isinstance(data, dict):
+        return None, None
+    token = data.get("accessToken")
+    if data.get("user") or token:
+        return True, token
+    return False, None  # пустой JSON {} = разлогинен
+
+
+def _chatgpt_http_session_alive(login: str) -> Optional[bool]:
+    """True/False — жива ли сессия по запросу; None — определить не удалось."""
+    alive, _ = _chatgpt_http_access_token(login)
+    return alive
+
+
+def _chatgpt_http_mfa_state(login: str) -> Optional[bool]:
+    """Состояние 2FA (аутентификатора) по запросу к /backend-api/me:
+    True — включён, False — выключен, None — определить не удалось (откат на браузер).
+
+    ПРИМЕЧАНИЕ: поле `mfa` в /backend-api/me — предполагаемое. Если OpenAI отдаёт его
+    иначе или поля нет — функция вернёт None, и монитор просто перейдёт на браузерную
+    проверку (без сбоя). После подтверждения эндпоинта другом можно будет доверять запросам."""
+    alive, token = _chatgpt_http_access_token(login)
+    if alive is None:
+        return None
+    if alive is False:
+        return None  # сессия слетела — решит браузерный путь (переустановит сессию)
+    status, data = _chatgpt_http_get_json(login, CHATGPT_ME_URL, bearer=token)
+    if status != 200 or not isinstance(data, dict):
+        return None
+    val = data.get("mfa")
+    if isinstance(val, bool):
+        return val
+    return None  # поля нет / неожиданный формат — не рискуем, откат на браузер
+
+
 def _run_chatgpt_login(
     account: "AccountDataConfig",
     account_number: int = 0,
@@ -5895,12 +6031,41 @@ def _code_monitor_window_active(account_number: int) -> bool:
 
 def _code_2fa_monitor_worker(account: "AccountDataConfig", account_number: int):
     """Фоновый поток: держит окно мониторинга живым, пока не истечёт таймер (продлеваемый
-    каждым !code). Реальную вкладку-наблюдатель открывает _code_2fa_monitor_session; после
-    реакции на выключенный 2FA (кик+включение) сессия мертва — вкладку переоткрываем."""
+    каждым !code).
+
+    Если включён HTTP-мониторинг (меню «Ещё») — сначала опрашиваем 2FA лёгкими запросами
+    (без браузера). Браузер поднимаем только когда: запрос заподозрил выключенный 2FA
+    (подтверждаем и реагируем), сессия для запросов слетела (переустанавливаем вход и
+    сохраняем сессию для запросов) или запросами определить не удалось (откат на браузер).
+    Если HTTP выключен — работает прежний проверенный браузерный путь."""
     login = account.login
     label = f"№{account_number} ({login})" if account_number else login
     try:
         while _code_monitor_window_active(account_number):
+            # Быстрый путь через запросы (если включён в настройках).
+            if getattr(SETTINGS, "http_monitor_enabled", False):
+                try:
+                    status = _code_2fa_monitor_http_loop(account, account_number, label)
+                except Exception:
+                    logger.error(f"2FA-мониторинг {label}: сбой HTTP-опроса, откат на браузер.", exc_info=True)
+                    status = "browser"
+                if status == "window_end":
+                    break
+                if status == "session_dead":
+                    _alert_bot_broadcast(
+                        f"🔁 {label}: сессия для запросов слетела — переустанавливаю вход браузером "
+                        "и сохраняю сессию для дальнейших запросов…"
+                    )
+                    try:
+                        _run_login_verify_notify(account, account_number, post_action="save_session")
+                    except Exception:
+                        logger.error(f"2FA-мониторинг {label}: не удалось переустановить сессию.", exc_info=True)
+                    if not _code_monitor_window_active(account_number):
+                        break
+                    time.sleep(CODE_MONITOR_REFRESH_SECONDS)
+                    continue
+                # status == "browser" → проверенный браузерный цикл ниже (подтверждение/реакция).
+
             try:
                 _code_2fa_monitor_session(account, account_number, label)
             except Exception:
@@ -5915,6 +6080,49 @@ def _code_2fa_monitor_worker(account: "AccountDataConfig", account_number: int):
             CODE_MONITOR_ACTIVE[account_number] = False
         log(f"2FA-мониторинг №{account_number}: окно закрыто.")
         _alert_bot_broadcast(f"⏹ {label}: 2FA-мониторинг завершён — окно {CODE_MONITOR_WINDOW_SECONDS // 60} мин истекло.")
+
+
+def _code_2fa_monitor_http_loop(account: "AccountDataConfig", account_number: int, label: str) -> str:
+    """Лёгкий опрос 2FA запросами (без браузера). Возвращает:
+      "window_end"   — окно мониторинга истекло;
+      "session_dead" — сессия для запросов слетела (нужен браузерный перезаход);
+      "browser"      — нужно проверить/среагировать браузером (запрос заподозрил выключенный
+                       2FA, либо определить запросами не удалось — надёжный откат)."""
+    login = account.login
+    if not (login and os.path.isfile(_chatgpt_session_path(login))):
+        return "browser"
+
+    alive = _chatgpt_http_session_alive(login)
+    if alive is None:
+        return "browser"      # curl_cffi/сеть недоступны — на браузер
+    if alive is False:
+        return "session_dead"
+
+    announced = False
+    unknown_streak = 0
+    while _code_monitor_window_active(account_number):
+        state = _chatgpt_http_mfa_state(login)
+        if state is True:
+            if not announced:
+                log(f"2FA-мониторинг {label}: слежу лёгкими запросами (без браузера).")
+                announced = True
+            unknown_streak = 0
+            time.sleep(CODE_MONITOR_REFRESH_SECONDS)
+            continue
+        if state is False:
+            # Запрос сообщает «2FA выключен» — НЕ реагируем сразу, а отдаём браузеру:
+            # он авторитетно подтвердит и, если правда выключен, кикнет и включит 2FA.
+            log(f"2FA-мониторинг {label}: запрос сообщает о выключенном 2FA — проверяю браузером.")
+            return "browser"
+        # state is None — запросом не определить. Сессия могла слететь.
+        if _chatgpt_http_session_alive(login) is False:
+            return "session_dead"
+        unknown_streak += 1
+        if unknown_streak >= 2:
+            # Запросам верить нельзя (эндпоинт не отдаёт mfa) — переходим на браузер.
+            return "browser"
+        time.sleep(CODE_MONITOR_REFRESH_SECONDS)
+    return "window_end"
 
 
 def _code_2fa_monitor_session(account: "AccountDataConfig", account_number: int, label: str) -> bool:
@@ -7561,15 +7769,19 @@ def _security_kb():
 def _more_text() -> str:
     error_state = "🟢 включена" if (SETTINGS and getattr(SETTINGS, "error_command_enabled", True)) else "🔴 отключена"
     shot_state = "🟢 включены" if (SETTINGS and getattr(SETTINGS, "monitor_screenshot_enabled", False)) else "🔴 выключены"
+    http_state = "🟢 включён" if (SETTINGS and getattr(SETTINGS, "http_monitor_enabled", False)) else "🔴 выключен"
     return (
         "⚙️ Ещё\n\n"
         f"📊 Лимит !code в день: {SETTINGS.max_per_day if SETTINGS else 3}\n"
         f"🛠 Команда !error: {error_state}\n"
-        f"🖥 Скриншоты мониторинга: {shot_state}\n\n"
+        f"🖥 Скриншоты мониторинга: {shot_state}\n"
+        f"⚡ HTTP-мониторинг (через запросы): {http_state}\n\n"
         "Редко используемые настройки: дневной лимит, команда !error, скриншоты мониторинга, "
-        "резервные копии и логи.\n"
+        "HTTP-мониторинг, резервные копии и логи.\n"
         "Когда !error отключена — покупателю приходит просьба описать проблему со скриншотами.\n"
-        "Скриншоты мониторинга: во время слежки за 2FA бот шлёт скриншот раз в 5 сек (для отладки)."
+        "Скриншоты мониторинга: во время слежки за 2FA бот шлёт скриншот раз в 5 сек (для отладки).\n"
+        "HTTP-мониторинг: слежка за 2FA лёгкими запросами (без браузера) — быстрее и легче; "
+        "браузер поднимается только для реакции и переустановки сессии."
     )
 
 
@@ -7587,6 +7799,12 @@ def _more_kb():
         if (SETTINGS and getattr(SETTINGS, "monitor_screenshot_enabled", False))
         else "🖥 Скриншоты мониторинга: 🔴 выкл",
         None, CBT.MONITOR_SHOT_TOGGLE,
+    ))
+    kb.row(B(
+        "⚡ HTTP-мониторинг: 🟢 вкл"
+        if (SETTINGS and getattr(SETTINGS, "http_monitor_enabled", False))
+        else "⚡ HTTP-мониторинг: 🔴 выкл",
+        None, CBT.HTTP_MONITOR_TOGGLE,
     ))
     kb.row(B("💾 Бэкап в Telegram", None, CBT.OPEN_BACKUP))
     kb.row(B("🧾 Логирование событий", None, CBT.OPEN_EVENT_LOGS))
@@ -12152,6 +12370,18 @@ def init(cardinal: "Cardinal"):
             pass
         open_more(c=c)
 
+    def toggle_http_monitor(c: CallbackQuery):
+        SETTINGS.http_monitor_enabled = not getattr(SETTINGS, "http_monitor_enabled", False)
+        save_settings()
+        try:
+            bot.answer_callback_query(
+                c.id,
+                "HTTP-мониторинг включён" if SETTINGS.http_monitor_enabled else "HTTP-мониторинг выключен",
+            )
+        except Exception:
+            pass
+        open_more(c=c)
+
     def act_chatgpt_selftest(c: CallbackQuery):
         try:
             bot.answer_callback_query(c.id, "Запускаю проверку…")
@@ -13077,6 +13307,7 @@ def init(cardinal: "Cardinal"):
     tg.cbq_handler(toggle_account_check, cbq_filter(data=CBT.ACCOUNT_CHECK_TOGGLE))
     tg.cbq_handler(toggle_error_command, cbq_filter(data=CBT.ERROR_CMD_TOGGLE))
     tg.cbq_handler(toggle_monitor_screenshot, cbq_filter(data=CBT.MONITOR_SHOT_TOGGLE))
+    tg.cbq_handler(toggle_http_monitor, cbq_filter(data=CBT.HTTP_MONITOR_TOGGLE))
     tg.cbq_handler(open_backup, cbq_filter(data=CBT.OPEN_BACKUP))
     tg.cbq_handler(act_backup_now, cbq_filter(data=CBT.BACKUP_NOW))
     tg.cbq_handler(open_stats, cbq_filter(data=CBT.OPEN_STATS))
