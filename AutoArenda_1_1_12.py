@@ -3945,7 +3945,9 @@ def _chatgpt_save_session(context, login: str):
 CHATGPT_HTTP_IMPERSONATE = "chrome"
 CHATGPT_HTTP_TIMEOUT = 15
 CHATGPT_AUTH_SESSION_URL = "https://chatgpt.com/api/auth/session"
-CHATGPT_ME_URL = "https://chatgpt.com/backend-api/me"
+# Закрытый веб-эндпоинт, который дёргает страница безопасности: отдаёт mfa_enabled и
+# список passkey (factors.passkeys). Путь/схема приватные и могут меняться без предупреждения.
+CHATGPT_MFA_INFO_URL = "https://chatgpt.com/backend-api/accounts/mfa_info"
 _CURL_CFFI_MODULE: Any = None
 _CURL_CFFI_FAILED = False
 
@@ -4045,21 +4047,20 @@ def _chatgpt_http_session_alive(login: str) -> Optional[bool]:
 
 
 def _chatgpt_http_mfa_state(login: str) -> Optional[bool]:
-    """Состояние 2FA (аутентификатора) по запросу к /backend-api/me:
+    """Состояние 2FA по запросу к /backend-api/accounts/mfa_info (поле mfa_enabled, строго bool):
     True — включён, False — выключен, None — определить не удалось (откат на браузер).
 
-    ПРИМЕЧАНИЕ: поле `mfa` в /backend-api/me — предполагаемое. Если OpenAI отдаёт его
-    иначе или поля нет — функция вернёт None, и монитор просто перейдёт на браузерную
-    проверку (без сбоя). После подтверждения эндпоинта другом можно будет доверять запросам."""
+    Эндпоинт подтверждён рабочей реализацией. Строгая проверка типа: доверяем только явному
+    bool в mfa_enabled — при любом другом формате возвращаем None (надёжный откат на браузер)."""
     alive, token = _chatgpt_http_access_token(login)
     if alive is None:
         return None
     if alive is False:
         return None  # сессия слетела — решит браузерный путь (переустановит сессию)
-    status, data = _chatgpt_http_get_json(login, CHATGPT_ME_URL, bearer=token)
+    status, data = _chatgpt_http_get_json(login, CHATGPT_MFA_INFO_URL, bearer=token)
     if status != 200 or not isinstance(data, dict):
         return None
-    val = data.get("mfa")
+    val = data.get("mfa_enabled")
     if isinstance(val, bool):
         return val
     return None  # поля нет / неожиданный формат — не рискуем, откат на браузер
