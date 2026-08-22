@@ -3948,6 +3948,9 @@ CHATGPT_AUTH_SESSION_URL = "https://chatgpt.com/api/auth/session"
 # Закрытый веб-эндпоинт, который дёргает страница безопасности: отдаёт mfa_enabled и
 # список passkey (factors.passkeys). Путь/схема приватные и могут меняться без предупреждения.
 CHATGPT_MFA_INFO_URL = "https://chatgpt.com/backend-api/accounts/mfa_info"
+# Сессии: список активных сессий и отзыв одной сессии по id (подтверждено рабочей реализацией).
+CHATGPT_SESSIONS_URL = "https://chatgpt.com/backend-api/accounts/sessions"
+CHATGPT_SESSION_REVOKE_URL = "https://chatgpt.com/backend-api/accounts/sessions/revoke"
 _CURL_CFFI_MODULE: Any = None
 _CURL_CFFI_FAILED = False
 
@@ -3994,31 +3997,55 @@ def _chatgpt_http_cookies(login: str) -> dict:
     return cookies
 
 
-def _chatgpt_http_get_json(login: str, url: str, bearer: Optional[str] = None):
-    """GET с cookies аккаунта и имперсонацией Chrome. Возвращает (status_code, json|None)
-    или (None, None) при сбое/недоступности curl_cffi."""
+def _url_path(url: str) -> str:
+    """Путь URL без домена и query — для заголовка x-openai-target-path."""
+    try:
+        return "/" + url.split("://", 1)[1].split("/", 1)[1].split("?", 1)[0]
+    except Exception:
+        return url
+
+
+def _chatgpt_http_call(login: str, method: str, url: str, bearer: Optional[str] = None, json_body=None):
+    """Запрос к ChatGPT с cookies, имперсонацией Chrome и заголовками как у веб-интерфейса
+    (Bearer, chatgpt-account-id из cookie `_account`, x-openai-target-path). Возвращает
+    (status_code, json|None) или (None, None) при сбое/недоступности curl_cffi."""
     cffi = _cffi_requests()
     if cffi is None:
         return None, None
     cookies = _chatgpt_http_cookies(login)
     if not cookies:
         return None, None
-    headers = {"accept": "application/json", "referer": "https://chatgpt.com/"}
+    target_path = _url_path(url)
+    headers = {
+        "accept": "*/*",
+        "oai-language": "en-US",
+        "referer": "https://chatgpt.com/",
+        "x-openai-target-path": target_path,
+        "x-openai-target-route": target_path,
+    }
     if bearer:
         headers["authorization"] = f"Bearer {bearer}"
+    account_id = cookies.get("_account") or ""
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
     try:
-        r = cffi.get(
-            url, cookies=cookies, headers=headers,
+        r = cffi.request(
+            method.upper(), url, cookies=cookies, headers=headers, json=json_body,
             impersonate=CHATGPT_HTTP_IMPERSONATE, timeout=CHATGPT_HTTP_TIMEOUT,
         )
     except Exception:
-        logger.debug(f"HTTP-мониторинг: запрос {url} не удался.", exc_info=True)
+        logger.debug(f"HTTP: запрос {method} {url} не удался.", exc_info=True)
         return None, None
     try:
         data = r.json()
     except Exception:
         data = None
     return r.status_code, data
+
+
+def _chatgpt_http_get_json(login: str, url: str, bearer: Optional[str] = None):
+    """GET-обёртка над _chatgpt_http_call (совместимость)."""
+    return _chatgpt_http_call(login, "GET", url, bearer=bearer)
 
 
 def _chatgpt_http_access_token(login: str):
@@ -4064,6 +4091,51 @@ def _chatgpt_http_mfa_state(login: str) -> Optional[bool]:
     if isinstance(val, bool):
         return val
     return None  # поля нет / неожиданный формат — не рискуем, откат на браузер
+
+
+def _chatgpt_http_kick_all_sessions(login: str) -> bool:
+    """Отзывает ВСЕ ЧУЖИЕ сессии запросами (без браузера):
+    GET /backend-api/accounts/sessions → для каждой не-текущей сессии
+    POST /backend-api/accounts/sessions/revoke {"session_id": ...}.
+
+    True — успешно отозвали все чужие сессии; False — HTTP выключен / нет сессии / не
+    удалось разобрать список / хоть один отзыв не прошёл → откат на браузерный кик.
+    Свою (текущую) сессию не трогаем, чтобы не оборвать себе доступ."""
+    if not getattr(SETTINGS, "http_monitor_enabled", False):
+        return False
+    alive, token = _chatgpt_http_access_token(login)
+    if not alive:
+        return False
+    status, data = _chatgpt_http_call(login, "GET", CHATGPT_SESSIONS_URL, bearer=token)
+    if status != 200 or not isinstance(data, dict):
+        return False
+    # Массив сессий может лежать под разными ключами — пробуем известные.
+    devices = None
+    for key in ("sessions", "data", "devices", "items"):
+        val = data.get(key)
+        if isinstance(val, list):
+            devices = val
+            break
+    if devices is None:
+        return False
+    others: list[str] = []
+    for d in devices:
+        if not isinstance(d, dict) or d.get("is_current_device"):
+            continue
+        sid = d.get("session_id") or d.get("hashed_device_id") or d.get("render_id")
+        if sid:
+            others.append(str(sid))
+    if not others:
+        return False  # чужих сессий не нашли — пусть подстрахует браузер
+    revoked = 0
+    for sid in others:
+        st, _ = _chatgpt_http_call(
+            login, "POST", CHATGPT_SESSION_REVOKE_URL, bearer=token, json_body={"session_id": sid}
+        )
+        if st is not None and 200 <= st < 300:
+            revoked += 1
+    log(f"HTTP-кик: отозвано чужих сессий {revoked}/{len(others)}.")
+    return revoked == len(others)
 
 
 def _run_chatgpt_login(
@@ -6052,6 +6124,12 @@ def _code_2fa_monitor_worker(account: "AccountDataConfig", account_number: int):
                     status = "browser"
                 if status == "window_end":
                     break
+                if status == "reacted":
+                    # 2FA поймали и отреагировали запросами — окно ещё живо, продолжаем следить.
+                    if not _code_monitor_window_active(account_number):
+                        break
+                    time.sleep(CODE_MONITOR_REFRESH_SECONDS)
+                    continue
                 if status == "session_dead":
                     _alert_bot_broadcast(
                         f"🔁 {label}: сессия для запросов слетела — переустанавливаю вход браузером "
@@ -6086,9 +6164,9 @@ def _code_2fa_monitor_worker(account: "AccountDataConfig", account_number: int):
 def _code_2fa_monitor_http_loop(account: "AccountDataConfig", account_number: int, label: str) -> str:
     """Лёгкий опрос 2FA запросами (без браузера). Возвращает:
       "window_end"   — окно мониторинга истекло;
+      "reacted"      — поймали выключенный 2FA и отреагировали запросами (кик) + реакция;
       "session_dead" — сессия для запросов слетела (нужен браузерный перезаход);
-      "browser"      — нужно проверить/среагировать браузером (запрос заподозрил выключенный
-                       2FA, либо определить запросами не удалось — надёжный откат)."""
+      "browser"      — определить/среагировать запросами не удалось — надёжный откат."""
     login = account.login
     if not (login and os.path.isfile(_chatgpt_session_path(login))):
         return "browser"
@@ -6111,10 +6189,19 @@ def _code_2fa_monitor_http_loop(account: "AccountDataConfig", account_number: in
             time.sleep(CODE_MONITOR_REFRESH_SECONDS)
             continue
         if state is False:
-            # Запрос сообщает «2FA выключен» — НЕ реагируем сразу, а отдаём браузеру:
-            # он авторитетно подтвердит и, если правда выключен, кикнет и включит 2FA.
-            log(f"2FA-мониторинг {label}: запрос сообщает о выключенном 2FA — проверяю браузером.")
-            return "browser"
+            # Двойная проверка, чтобы исключить разовый сбой ответа: только если ВТОРОЙ
+            # запрос тоже вернул «выключен» — доверяем и реагируем запросами.
+            if _chatgpt_http_mfa_state(login) is not False:
+                log(f"2FA-мониторинг {label}: разовый «2FA выключен» не подтвердился — на браузер.")
+                return "browser"
+            log(f"2FA-мониторинг {label}: 2FA выключен (подтверждено дважды запросом) — кикаю сессии и реагирую.")
+            kicked = _chatgpt_http_kick_all_sessions(login)
+            if kicked:
+                _alert_bot_broadcast(f"🚪 {label}: 2FA выключен — чужие сеансы отозваны запросом (без браузера).")
+            # Реакция: если кик уже сделан запросом — already_kicked=True (реакция только
+            # сменит пароль и включит 2FA); иначе реакция сама кикнет (HTTP → браузер).
+            _react_2fa_turned_off(account, account_number, label, already_kicked=kicked)
+            return "reacted"
         # state is None — запросом не определить. Сессия могла слететь.
         if _chatgpt_http_session_alive(login) is False:
             return "session_dead"
@@ -6272,10 +6359,15 @@ def _react_2fa_turned_off(account: "AccountDataConfig", account_number: int, lab
             f"🕒 Время (МСК): {detected_at.strftime('%H:%M:%S')}\n\n"
             "🚪 Моментально выкидываю все сеансы, затем меняю пароль…"
         )
-        try:
-            _run_chatgpt_login(account, account_number, post_action="kick_sessions")
-        except Exception:
-            logger.error(f"2FA-реакция {label}: кик сеансов не удался.", exc_info=True)
+        # Сначала пробуем отозвать чужие сессии ЗАПРОСОМ (быстро, без браузера); если не
+        # вышло (HTTP выключен / не удалось) — браузерный кик.
+        if _chatgpt_http_kick_all_sessions(account.login):
+            _alert_bot_broadcast(f"🚪 {label}: чужие сеансы отозваны запросом (без браузера).")
+        else:
+            try:
+                _run_chatgpt_login(account, account_number, post_action="kick_sessions")
+            except Exception:
+                logger.error(f"2FA-реакция {label}: кик сеансов не удался.", exc_info=True)
 
     # Снимок сессии после выхода со всех устройств недействителен — убираем.
     _delete_chatgpt_session(account.login)
