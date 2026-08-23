@@ -169,6 +169,10 @@ CODE_MONITOR_LOCK = Lock()
 CODE_MONITOR_UNTIL: dict[int, float] = {}
 # account_number -> идёт ли уже поток мониторинга для этого аккаунта.
 CODE_MONITOR_ACTIVE: dict[int, bool] = {}
+# Реакция на «бота выкинуло во время мониторинга» (сброс пароля) — не чаще раза в кулдаун,
+# чтобы при повторных сбоях не менять пароль в цикле.
+CODE_MONITOR_KICK_REACT_COOLDOWN_SECONDS = 10 * 60
+CODE_MONITOR_KICK_REACT_LAST_AT: dict[int, float] = {}
 
 # Авто-откат смены email ChatGPT через headless Playwright.
 _PLAYWRIGHT_MODULE: Any = None
@@ -6132,20 +6136,8 @@ def _code_2fa_monitor_worker(account: "AccountDataConfig", account_number: int):
                         break
                     time.sleep(CODE_MONITOR_REFRESH_SECONDS)
                     continue
-                if status == "session_dead":
-                    _alert_bot_broadcast(
-                        f"🔁 {label}: сессия для запросов слетела — переустанавливаю вход браузером "
-                        "и сохраняю сессию для дальнейших запросов…"
-                    )
-                    try:
-                        _run_login_verify_notify(account, account_number, post_action="save_session")
-                    except Exception:
-                        logger.error(f"2FA-мониторинг {label}: не удалось переустановить сессию.", exc_info=True)
-                    if not _code_monitor_window_active(account_number):
-                        break
-                    time.sleep(CODE_MONITOR_REFRESH_SECONDS)
-                    continue
-                # status == "browser" → проверенный браузерный цикл ниже (подтверждение/реакция).
+                # status == "browser" → проверенный браузерный цикл ниже. Он же авторитетно
+                # подтверждает «бота выкинуло» (сессия пропала) и реагирует сменой пароля.
 
             try:
                 _code_2fa_monitor_session(account, account_number, label)
@@ -6167,8 +6159,9 @@ def _code_2fa_monitor_http_loop(account: "AccountDataConfig", account_number: in
     """Лёгкий опрос 2FA запросами (без браузера). Возвращает:
       "window_end"   — окно мониторинга истекло;
       "reacted"      — поймали выключенный 2FA и отреагировали запросами (кик) + реакция;
-      "session_dead" — сессия для запросов слетела (нужен браузерный перезаход);
-      "browser"      — определить/среагировать запросами не удалось — надёжный откат."""
+      "browser"      — определить/среагировать запросами не удалось ИЛИ сессия пропала
+                       (бота выкинуло) — отдаём браузеру: он подтвердит и, если это кик,
+                       моментально сменит пароль."""
     login = account.login
     if not (login and os.path.isfile(_chatgpt_session_path(login))):
         return "browser"
@@ -6177,7 +6170,7 @@ def _code_2fa_monitor_http_loop(account: "AccountDataConfig", account_number: in
     if alive is None:
         return "browser"      # curl_cffi/сеть недоступны — на браузер
     if alive is False:
-        return "session_dead"
+        return "browser"      # сессия пропала — браузер подтвердит кик и сменит пароль
 
     announced = False
     unknown_streak = 0
@@ -6206,7 +6199,7 @@ def _code_2fa_monitor_http_loop(account: "AccountDataConfig", account_number: in
             return "reacted"
         # state is None — запросом не определить. Сессия могла слететь.
         if _chatgpt_http_session_alive(login) is False:
-            return "session_dead"
+            return "browser"   # сессия пропала — браузер подтвердит кик и сменит пароль
         unknown_streak += 1
         if unknown_streak >= 2:
             # Запросам верить нельзя (эндпоинт не отдаёт mfa) — переходим на браузер.
@@ -6324,17 +6317,71 @@ def _code_2fa_monitor_session(account: "AccountDataConfig", account_number: int,
         return True
 
     if lost_session:
-        # Выкинуло с аккаунта во время наблюдения — как /kick: заходим заново и сбрасываем
-        # все сеансы, снимок сессии обновляется самим входом.
-        _alert_bot_broadcast(
-            f"🔑 {label}: во время 2FA-мониторинга выкинуло с аккаунта — "
-            "захожу заново и сбрасываю все сеансы."
-        )
-        try:
-            _run_chatgpt_login(account, account_number, post_action="kick_sessions_fast")
-        except Exception:
-            logger.error(f"2FA-мониторинг {label}: не удалось перезайти после разлогина.", exc_info=True)
+        # Браузер АВТОРИТЕТНО подтвердил: бота выкинуло (сессия была, но мы не залогинены)
+        # — значит кто-то сбросил все сеансы. Это инцидент → моментально меняем пароль.
+        if _kick_react_on_cooldown(account_number):
+            # Недавно уже реагировали сменой пароля — не спамим, просто переустанавливаем сессию.
+            _alert_bot_broadcast(f"🔑 {label}: снова нет сессии — недавно уже менял пароль, переустанавливаю вход.")
+            try:
+                _run_login_verify_notify(account, account_number, post_action="save_session")
+            except Exception:
+                logger.error(f"2FA-мониторинг {label}: не удалось переустановить сессию.", exc_info=True)
+        else:
+            _note_kick_react(account_number)
+            _react_bot_kicked(account, account_number, label)
     return False
+
+
+def _kick_react_on_cooldown(account_number: int) -> bool:
+    last = CODE_MONITOR_KICK_REACT_LAST_AT.get(account_number or 0, 0.0)
+    return (time.time() - last) < CODE_MONITOR_KICK_REACT_COOLDOWN_SECONDS
+
+
+def _note_kick_react(account_number: int):
+    CODE_MONITOR_KICK_REACT_LAST_AT[account_number or 0] = time.time()
+
+
+def _react_bot_kicked(account: "AccountDataConfig", account_number: int, label: str):
+    """Реакция на «бота выкинуло с аккаунта во время мониторинга» (сессия была, но пропала —
+    вероятно, кто-то сбросил все сеансы, чтобы выбить бота). Трактуем как инцидент:
+    МОМЕНТАЛЬНО меняем пароль (это запирает мошенника и инвалидирует его сессии), затем
+    проверяем/включаем 2FA и восстанавливаем рабочую сессию для дальнейшего мониторинга."""
+    detected_at = _now_msk()
+    _alert_bot_broadcast(
+        "🚨 Бота ВЫКИНУЛО с аккаунта во время мониторинга!\n\n"
+        f"🙍 Аккаунт: {label}\n"
+        f"📅 Дата: {detected_at.strftime('%d.%m.%Y')}\n"
+        f"🕒 Время (МСК): {detected_at.strftime('%H:%M:%S')}\n\n"
+        "Похоже, кто-то сбросил все сеансы (выбил бота). Моментально меняю пароль…"
+    )
+    _delete_chatgpt_session(account.login)
+
+    # 1) Смена пароля через «Забыли пароль?» (работает без сессии; внутри — проверочный вход).
+    try:
+        ok, new_password = _recover_password_and_verify(account, account_number)
+    except Exception:
+        logger.error(f"Реакция на кик {label}: смена пароля не удалась.", exc_info=True)
+        ok, new_password = False, ""
+    if ok:
+        _unmark_account_broken(account_number)
+        _alert_bot_broadcast(
+            f"✅ {label}: пароль изменён и сохранён.\n"
+            f"🔐 Новый пароль: {new_password}\n"
+            "Покупатели получат его командой !account."
+        )
+    else:
+        _alert_bot_broadcast(
+            f"⚠️ {label}: не удалось сменить пароль автоматически — нужна ручная проверка "
+            "(скриншоты в боте оповещений)."
+        )
+
+    # 2) Проверяем/включаем 2FA и восстанавливаем рабочую сессию (под новым паролем).
+    _mark_self_mfa_change(account_number)
+    try:
+        _run_login_verify_notify(account, account_number, post_action="check")
+    except Exception:
+        logger.error(f"Реакция на кик {label}: перезаход/проверка 2FA не удалась.", exc_info=True)
+    _mark_self_mfa_change(account_number)
 
 
 def _react_2fa_turned_off(account: "AccountDataConfig", account_number: int, label: str, already_kicked: bool = False):
