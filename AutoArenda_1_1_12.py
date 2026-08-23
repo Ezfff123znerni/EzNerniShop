@@ -162,6 +162,8 @@ ANTI_DELETE_THREAD_LOCK = Lock()
 # от ПОСЛЕДНЕГО запроса !code: если код просят несколько человек, отсчёт идёт от последнего.
 CODE_MONITOR_REFRESH_SECONDS = 5
 CODE_MONITOR_WINDOW_SECONDS = 10 * 60
+# Тестовое окно для ручной проверки системы командой /2famonitoring (5 минут).
+CODE_MONITOR_TEST_WINDOW_SECONDS = 5 * 60
 CODE_MONITOR_LOCK = Lock()
 # account_number -> unix-время, до которого держим мониторинг (продлевается каждым !code).
 CODE_MONITOR_UNTIL: dict[int, float] = {}
@@ -6053,18 +6055,23 @@ def _delete_chatgpt_session(login: Optional[str]):
 #   4) Ключи доступа (passkey) при этом отдельно ловятся по почте
 #      (_maybe_handle_chatgpt_passkey_added) — страницу для этого открывать не нужно.
 
-def _start_code_2fa_monitor(account: "AccountDataConfig", account_number: int):
-    """Продлевает окно 2FA-мониторинга на 10 минут от текущего !code и, если поток для
-    аккаунта ещё не идёт, запускает его."""
+def _start_code_2fa_monitor(account: "AccountDataConfig", account_number: int,
+                            window_seconds: Optional[int] = None, source: str = "!code"):
+    """Продлевает окно 2FA-мониторинга и, если поток для аккаунта ещё не идёт, запускает его.
+
+    window_seconds — длительность окна (по умолчанию CODE_MONITOR_WINDOW_SECONDS = 10 мин).
+    source — что инициировало мониторинг (для текста уведомления): «!code» или тест-команда."""
     if account is None:
         return
     if not account_number:
         account_number = _account_number_of(account)
     if not account_number:
         return
+    window = int(window_seconds or CODE_MONITOR_WINDOW_SECONDS)
+    minutes = max(1, window // 60)
     start_needed = False
     with CODE_MONITOR_LOCK:
-        CODE_MONITOR_UNTIL[account_number] = time.time() + CODE_MONITOR_WINDOW_SECONDS
+        CODE_MONITOR_UNTIL[account_number] = time.time() + window
         if not CODE_MONITOR_ACTIVE.get(account_number):
             CODE_MONITOR_ACTIVE[account_number] = True
             start_needed = True
@@ -6076,23 +6083,18 @@ def _start_code_2fa_monitor(account: "AccountDataConfig", account_number: int):
             daemon=True,
         ).start()
         log(
-            f"2FA-мониторинг №{account_number}: запущен, обновляю страницу раз в "
-            f"{CODE_MONITOR_REFRESH_SECONDS} сек в течение "
-            f"{CODE_MONITOR_WINDOW_SECONDS // 60} мин от последнего !code."
+            f"2FA-мониторинг №{account_number}: запущен, обновляю раз в "
+            f"{CODE_MONITOR_REFRESH_SECONDS} сек в течение {minutes} мин (источник: {source})."
         )
         _alert_bot_broadcast(
-            f"▶️ {label}: начал 2FA-мониторинг на {CODE_MONITOR_WINDOW_SECONDS // 60} мин — "
-            f"держу вкладку «Безопасность» и обновляю её раз в {CODE_MONITOR_REFRESH_SECONDS} сек. "
-            "Слежу, чтобы не выключили аутентификатор и не добавили ключ доступа."
+            f"▶️ {label}: начал 2FA-мониторинг на {minutes} мин (источник: {source}) — "
+            f"проверяю состояние аутентификатора раз в {CODE_MONITOR_REFRESH_SECONDS} сек. "
+            "Слежу, чтобы не выключили 2FA и не добавили ключ доступа."
         )
     else:
-        log(
-            f"2FA-мониторинг №{account_number}: окно продлено ещё на "
-            f"{CODE_MONITOR_WINDOW_SECONDS // 60} мин от нового !code."
-        )
+        log(f"2FA-мониторинг №{account_number}: окно продлено до {minutes} мин (источник: {source}).")
         _alert_bot_broadcast(
-            f"🔄 {label}: новый !code — продлил окно 2FA-мониторинга ещё на "
-            f"{CODE_MONITOR_WINDOW_SECONDS // 60} мин от последнего запроса."
+            f"🔄 {label}: продлил окно 2FA-мониторинга ещё на {minutes} мин (источник: {source})."
         )
 
 
@@ -13683,6 +13685,46 @@ def init(cardinal: "Cardinal"):
 
     tg.msg_handler(handle_2facheck, commands=["2facheck"])
 
+    def handle_2famonitoring(message: Message):
+        parts = (message.text or "").split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            bot.send_message(
+                message.chat.id,
+                "Использование: /2famonitoring <номер аккаунта>\nНапример: /2famonitoring 1\n\n"
+                "Запускает тестовый 2FA-мониторинг на 5 минут — то же самое, что при !code, "
+                "но вручную (для проверки системы перед выдачей аккаунта людям).",
+                parse_mode=None,
+            )
+            return
+        number = int(parts[1])
+        account = _get_account(number)
+        if not account:
+            bot.send_message(message.chat.id, f"❌ Аккаунт №{number} не найден.", parse_mode=None)
+            return
+        if not getattr(account, "auth_key", None):
+            bot.send_message(
+                message.chat.id,
+                f"⚠️ У аккаунта №{number} не задан 2FA key — мониторинг запущу, но реакция "
+                "включения 2FA может не сработать. Лучше сперва задать ключ.",
+                parse_mode=None,
+            )
+        minutes = CODE_MONITOR_TEST_WINDOW_SECONDS // 60
+        bot.send_message(
+            message.chat.id,
+            f"▶️ Запускаю тестовый 2FA-мониторинг аккаунта №{number} ({account.login}) "
+            f"на {minutes} мин.\n"
+            "Ход и срабатывания придут в бот оповещений. Попробуй выключить 2FA — "
+            "система должна кикнуть сессии, сменить пароль и включить 2FA обратно.",
+            parse_mode=None,
+        )
+        _start_code_2fa_monitor(
+            account, number,
+            window_seconds=CODE_MONITOR_TEST_WINDOW_SECONDS,
+            source="/2famonitoring (тест)",
+        )
+
+    tg.msg_handler(handle_2famonitoring, commands=["2famonitoring"])
+
     def handle_passkeys(message: Message):
         parts = (message.text or "").split()
         if len(parts) < 2 or not parts[1].isdigit():
@@ -13907,6 +13949,10 @@ def init(cardinal: "Cardinal"):
         cardinal.add_telegram_commands(UUID, [("2facheck", "проверить, включён ли 2FA: /2facheck 1", True)])
     except Exception:
         logger.debug("Не удалось зарегистрировать /2facheck", exc_info=True)
+    try:
+        cardinal.add_telegram_commands(UUID, [("2famonitoring", "тест 2FA-мониторинга на 5 мин: /2famonitoring 1", True)])
+    except Exception:
+        logger.debug("Не удалось зарегистрировать /2famonitoring", exc_info=True)
     try:
         cardinal.add_telegram_commands(UUID, [("passkeys", "проверить и удалить ключи доступа (passkey): /passkeys 1", True)])
     except Exception:
